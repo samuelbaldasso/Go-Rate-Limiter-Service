@@ -1,4 +1,4 @@
-# golang_rate_limiter
+# Golang Rate Limiter
 
 Microsserviço HTTP em Go que implementa rate limiting por cliente usando o
 algoritmo **Token Bucket**, construído inteiramente com a biblioteca padrão
