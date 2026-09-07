@@ -1,147 +1,148 @@
 # Golang Rate Limiter
 
-Microsserviço HTTP em Go que implementa rate limiting por cliente usando o
-algoritmo **Token Bucket**, construído inteiramente com a biblioteca padrão
-(`net/http`, `sync`, `time`, `context`) — sem dependências externas.
+HTTP microservice in Go implementing per-client rate limiting using the
+**Token Bucket** algorithm, built entirely with the standard library
+(`net/http`, `sync`, `time`, `context`) — no external dependencies.
 
-## Sumário
+## Table of Contents
 
-- [Visão geral](#visão-geral)
-- [Arquitetura](#arquitetura)
-- [Estrutura de diretórios](#estrutura-de-diretórios)
-- [Configuração (variáveis de ambiente)](#configuração-variáveis-de-ambiente)
-- [Como rodar](#como-rodar)
-- [Testes](#testes)
-- [Comportamento observado](#comportamento-observado)
-- [Limitações conhecidas](#limitações-conhecidas)
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Directory structure](#directory-structure)
+- [Configuration (environment variables)](#configuration-environment-variables)
+- [Running it](#running-it)
+- [Tests](#tests)
+- [Observed behavior](#observed-behavior)
+- [Known limitations](#known-limitations)
 - [ADRs](#adrs)
 
-## Visão geral
+## Overview
 
-O serviço expõe um handler HTTP protegido por um middleware de rate limiting.
-Cada cliente é identificado por IP (com suporte a `X-Forwarded-For`) e recebe
-um "balde" de tokens que se esvazia a cada requisição e se reabastece a uma
-taxa configurável ao longo do tempo. Quando o balde de um cliente está vazio,
-o serviço responde `429 Too Many Requests`; caso contrário, a requisição é
-repassada normalmente ao handler final.
+The service exposes an HTTP handler protected by a rate-limiting middleware.
+Each client is identified by IP (with `X-Forwarded-For` support) and gets a
+"bucket" of tokens that drains with each request and refills at a
+configurable rate over time. When a client's bucket is empty, the service
+responds with `429 Too Many Requests`; otherwise the request is passed
+through to the final handler normally.
 
-O estado de cada cliente (tokens restantes, timestamp da última requisição) é
-mantido inteiramente em memória, em um `map[string]*visitor` protegido por
-locks — não há dependência de banco de dados ou cache externo.
+Each client's state (remaining tokens, timestamp of the last request) is
+kept entirely in memory, in a `map[string]*visitor` protected by locks —
+there's no dependency on a database or external cache.
 
-## Arquitetura
+## Architecture
 
 ```
                  ┌─────────────────────────┐
-  Requisição --> │  RateLimit middleware    │
-                 │  (extrai IP do cliente)  │
+  Request -->    │  RateLimit middleware    │
+                 │  (extracts client IP)    │
                  └─────────────┬────────────┘
                                │
                                v
                  ┌─────────────────────────┐
                  │  Limiter.Allow(ip)       │
-                 │  - RWMutex global        │
-                 │    (busca/cria visitor)  │
-                 │  - Mutex por visitor     │
-                 │    (matemática de token) │
+                 │  - Global RWMutex        │
+                 │    (lookup/create        │
+                 │     visitor)             │
+                 │  - Per-visitor Mutex     │
+                 │    (token math)          │
                  └─────────────┬────────────┘
                                │
                  200 (allow)   │   429 (deny)
                                v
                  ┌─────────────────────────┐
-                 │  Handler final (mux)     │
+                 │  Final handler (mux)     │
                  └─────────────────────────┘
 
-  Goroutine de cleanup (time.Ticker) roda em paralelo,
-  removendo visitantes inativos há mais que o TTL configurado.
+  A cleanup goroutine (time.Ticker) runs in parallel,
+  removing visitors inactive for longer than the configured TTL.
 ```
 
-**Fluxo de uma requisição:**
+**Request flow:**
 
-1. O middleware `RateLimit` extrai o IP do cliente (`internal/middleware/rate_limit.go`).
-2. Chama `Limiter.Allow(ip)` (`internal/limiter/bucket.go`), que:
-   - Busca o `visitor` correspondente ao IP (lock de leitura no mapa global; lock de escrita apenas se o visitante ainda não existir).
-   - Trava o `Mutex` individual do visitante, calcula quantos tokens foram acumulados desde a última requisição (`elapsed * rate`, limitado ao `burst`), e decrementa um token se houver saldo.
-3. Se `Allow` retornar `false`, responde `429`. Caso contrário, repassa para o handler seguinte.
-4. Em paralelo, uma goroutine de limpeza (`StartCleanup`) varre o mapa periodicamente e remove visitantes inativos há mais que o TTL configurado, evitando vazamento de memória.
+1. The `RateLimit` middleware extracts the client's IP (`internal/middleware/rate_limit.go`).
+2. It calls `Limiter.Allow(ip)` (`internal/limiter/bucket.go`), which:
+   - Looks up the `visitor` for that IP (read lock on the global map; write lock only if the visitor doesn't exist yet).
+   - Locks the visitor's individual `Mutex`, calculates how many tokens have accumulated since the last request (`elapsed * rate`, capped at `burst`), and decrements a token if there's balance available.
+3. If `Allow` returns `false`, the service responds `429`. Otherwise, the request is passed to the next handler.
+4. In parallel, a cleanup goroutine (`StartCleanup`) periodically sweeps the map and removes visitors inactive for longer than the configured TTL, preventing memory leaks.
 
-## Estrutura de diretórios
+## Directory structure
 
 ```
-cmd/api/main.go                    Ponto de entrada: sobe o servidor HTTP,
-                                    lê configuração via env vars, registra
-                                    rotas e o middleware, trata shutdown
-                                    gracioso.
+cmd/api/main.go                    Entry point: starts the HTTP server,
+                                    reads configuration from env vars,
+                                    registers routes and the middleware,
+                                    handles graceful shutdown.
 
-internal/limiter/bucket.go         Lógica de negócio do Token Bucket:
-                                    struct Visitor, struct Limiter, Allow(),
+internal/limiter/bucket.go         Token Bucket business logic:
+                                    Visitor struct, Limiter struct, Allow(),
                                     StartCleanup().
 
-internal/limiter/bucket_test.go    Testes unitários do limiter (burst,
-                                    refill, concorrência, cleanup).
+internal/limiter/bucket_test.go    Unit tests for the limiter (burst,
+                                    refill, concurrency, cleanup).
 
-internal/middleware/rate_limit.go  Middleware HTTP que envelopa um
-                                    http.Handler e consulta o limiter antes
-                                    de repassar a requisição.
+internal/middleware/rate_limit.go  HTTP middleware that wraps an
+                                    http.Handler and consults the limiter
+                                    before passing the request through.
 
 internal/middleware/rate_limit_test.go
-                                    Testes do middleware via httptest.
+                                    Middleware tests via httptest.
 
-Dockerfile                         Build multi-stage (builder golang:alpine
-                                    -> imagem final scratch).
+Dockerfile                         Multi-stage build (golang:alpine
+                                    builder -> scratch final image).
 
-docker-compose.yml                 Sobe o serviço localmente com defaults.
+docker-compose.yml                 Runs the service locally with defaults.
 ```
 
-## Configuração (variáveis de ambiente)
+## Configuration (environment variables)
 
-| Variável                      | Default | Descrição                                            |
-|--------------------------------|---------|-------------------------------------------------------|
-| `PORT`                         | `8080`  | Porta em que o servidor HTTP escuta.                   |
-| `RATE_LIMIT_RPS`                | `5`     | Tokens (requisições) reabastecidos por segundo, por cliente. |
-| `RATE_LIMIT_BURST`              | `10`    | Capacidade máxima do balde (nº de requisições em rajada permitidas). |
-| `RATE_LIMIT_CLEANUP_INTERVAL`   | `1m`    | Intervalo entre varreduras da goroutine de limpeza.    |
-| `RATE_LIMIT_VISITOR_TTL`        | `3m`    | Tempo de inatividade após o qual um visitante é removido do mapa. |
+| Variable                       | Default | Description                                                  |
+|----------------------------------|---------|-----------------------------------------------------------------|
+| `PORT`                          | `8080`  | Port the HTTP server listens on.                              |
+| `RATE_LIMIT_RPS`                 | `5`     | Tokens (requests) refilled per second, per client.            |
+| `RATE_LIMIT_BURST`               | `10`    | Maximum bucket capacity (number of burst requests allowed).   |
+| `RATE_LIMIT_CLEANUP_INTERVAL`    | `1m`    | Interval between cleanup goroutine sweeps.                    |
+| `RATE_LIMIT_VISITOR_TTL`         | `3m`    | Idle time after which a visitor is removed from the map.      |
 
-## Como rodar
+## Running it
 
-Via Docker Compose (recomendado, não requer Go instalado):
+Via Docker Compose (recommended, no local Go install required):
 
 ```bash
 docker compose up --build
 ```
 
-Localmente, com Go instalado:
+Locally, with Go installed:
 
 ```bash
 go run ./cmd/api
 ```
 
-O serviço estará disponível em `http://localhost:8080`.
+The service will be available at `http://localhost:8080`.
 
-## Testes
+## Tests
 
 ```bash
 go vet ./...
 go test -race ./...
 ```
 
-Ou via Docker, sem precisar instalar Go:
+Or via Docker, without installing Go:
 
 ```bash
 docker run --rm -v "$PWD":/src -w /src golang:1.22-alpine \
   sh -c "go vet ./... && go test -race ./..."
 ```
 
-Cobertura atual:
-- `internal/limiter`: burst e negação após esgotamento, reabastecimento ao longo do tempo, independência entre chaves distintas, concorrência na mesma chave (`-race`), remoção de visitantes inativos.
-- `internal/middleware`: resposta `429` após esgotar o burst, isolamento de clientes via `X-Forwarded-For`, fallback de extração de IP para `RemoteAddr`.
+Current coverage:
+- `internal/limiter`: burst and denial after exhaustion, refill over time, independence between distinct keys, concurrency on the same key (`-race`), removal of inactive visitors.
+- `internal/middleware`: `429` response after exhausting burst, client isolation via `X-Forwarded-For`, IP-extraction fallback to `RemoteAddr`.
 
-Não coberto (fora de escopo desta entrega): testes de carga/benchmark e testes de integração via container real.
+Not covered (out of scope for this delivery): load/benchmark testing and integration tests against a real container.
 
-## Comportamento observado
+## Observed behavior
 
-Com os defaults (`RATE_LIMIT_RPS=5`, `RATE_LIMIT_BURST=10`), 12 requisições em sequência imediata resultam em:
+With the defaults (`RATE_LIMIT_RPS=5`, `RATE_LIMIT_BURST=10`), 12 requests fired back-to-back result in:
 
 ```
 request 1..10: 200
@@ -149,107 +150,107 @@ request 11:    429
 request 12:    429
 ```
 
-Após ~1s de espera, uma nova requisição volta a ser aceita (`200`), pois o balde é reabastecido a 5 tokens/segundo.
+After waiting ~1s, a new request is accepted again (`200`), since the bucket refills at 5 tokens/second.
 
-## Limitações conhecidas
+## Known limitations
 
-- **Estado não compartilhado entre réplicas**: o mapa de visitantes vive na memória do processo. Rodar múltiplas réplicas do serviço atrás de um load balancer resulta em limites efetivos multiplicados pelo número de réplicas (cada uma mantém seu próprio balde por cliente). Para rate limiting distribuído corretamente, seria necessário um store compartilhado (ex.: Redis) — fora do escopo deste exercício, que pede explicitamente estado em memória.
-- **`X-Forwarded-For` confiado sem validação de proxy**: o serviço usa o primeiro IP do header `X-Forwarded-For` quando presente, sem validar que a requisição de fato veio de um proxy confiável. Um cliente malicioso com acesso direto ao serviço pode forjar esse header e contornar o limite por IP. Aceitável para este exercício; requer um proxy reverso confiável na frente (que sobrescreva/valide o header) antes de uso em produção exposta à internet.
-- **Imagem final em `scratch`**: não contém `ca-certificates` nem shell. Suficiente para este serviço (não faz chamadas HTTPS externas), mas exigiria ajuste (`ca-certificates` ou base `alpine`) se o serviço vier a fazer chamadas para APIs externas via TLS.
+- **State not shared across replicas**: the visitor map lives in the process's memory. Running multiple replicas of the service behind a load balancer results in effective limits multiplied by the number of replicas (each keeps its own bucket per client). Correct distributed rate limiting would require a shared store (e.g., Redis) — out of scope for this exercise, which explicitly calls for in-memory state.
+- **`X-Forwarded-For` trusted without proxy validation**: the service uses the first IP in the `X-Forwarded-For` header when present, without validating that the request actually came through a trusted proxy. A malicious client with direct access to the service can forge this header and bypass its per-IP limit. Acceptable for this exercise; a trusted reverse proxy in front (that overwrites/validates the header) would be required before use in production exposed to the internet.
+- **Final image on `scratch`**: contains no `ca-certificates` and no shell. Sufficient for this service (it makes no outbound HTTPS calls), but would need adjustment (`ca-certificates`, or an `alpine` base) if the service starts making calls to external APIs over TLS.
 
 ## ADRs
 
-### ADR-001: Token Bucket como algoritmo de rate limiting
+### ADR-001: Token Bucket as the rate-limiting algorithm
 
-**Status:** Aceito
+**Status:** Accepted
 
-**Contexto:** É necessário escolher um algoritmo de rate limiting por cliente. As opções consideradas foram Token Bucket, Fixed Window Counter e Sliding Window Log/Counter.
+**Context:** A per-client rate-limiting algorithm needs to be chosen. The options considered were Token Bucket, Fixed Window Counter, and Sliding Window Log/Counter.
 
-**Decisão:** Usar Token Bucket, com implementação manual (sem `golang.org/x/time/rate`), calculando tokens acumulados sob demanda a partir do `time.Duration` decorrido desde a última requisição — sem necessidade de goroutine dedicada por cliente para "encher" o balde.
+**Decision:** Use Token Bucket, with a manual implementation (not `golang.org/x/time/rate`), computing accumulated tokens on demand from the `time.Duration` elapsed since the last request — no need for a dedicated per-client goroutine to "fill" the bucket.
 
-**Alternativas descartadas:**
-- *Fixed Window Counter*: mais simples, mas permite picos de até 2x o limite na borda entre janelas (ex.: rajada no fim de uma janela + rajada no início da próxima).
-- *Sliding Window Log*: mais preciso, mas exigiria armazenar timestamps de cada requisição por cliente, aumentando uso de memória e complexidade sem necessidade real para este caso de uso.
-- *`golang.org/x/time/rate`*: implementa Token Bucket de forma robusta e testada, mas foi descartado porque o requisito explícito era usar apenas a biblioteca padrão do Go (`sync`, `time`) — o objetivo é também didático, para exercitar a lógica de concorrência manualmente.
+**Alternatives discarded:**
+- *Fixed Window Counter*: simpler, but allows bursts of up to 2x the limit at the boundary between windows (e.g., a burst at the end of one window plus a burst at the start of the next).
+- *Sliding Window Log*: more precise, but would require storing per-client request timestamps, increasing memory usage and complexity with no real need for this use case.
+- *`golang.org/x/time/rate`*: implements Token Bucket robustly and is well-tested, but was ruled out because the explicit requirement was to use only Go's standard library (`sync`, `time`) — the goal is also didactic, to exercise the concurrency logic by hand.
 
-**Consequências:** A lógica de refill é *lazy* (calculada no momento da requisição, não por um timer contínuo por cliente), o que é mais eficiente em memória e CPU para um número grande de clientes esparsos, mas exige cuidado para não haver overflow do balde acima do `burst` configurado (mitigado com `if v.tokens > l.burst { v.tokens = l.burst }`).
-
----
-
-### ADR-002: Granularidade de locks — RWMutex global + Mutex por visitante
-
-**Status:** Aceito
-
-**Contexto:** Múltiplas goroutines podem acessar e modificar o estado de rate limiting concorrentemente — tanto para clientes diferentes quanto, ocasionalmente, para o mesmo cliente (requisições simultâneas do mesmo IP).
-
-**Decisão:** Usar dois níveis de lock:
-1. Um `sync.RWMutex` no `Limiter`, usado com `RLock` para leitura (caminho comum: visitante já existe) e `Lock` apenas na criação de um novo visitante (com *double-checked locking* para evitar condição de corrida entre o `RUnlock` e o `Lock` de escrita).
-2. Um `sync.Mutex` individual dentro de cada `visitor`, protegendo apenas o cálculo de tokens daquele cliente específico.
-
-**Alternativas descartadas:**
-- *Um único Mutex global* protegendo leitura, criação e matemática de tokens: mais simples, porém serializaria **todas** as requisições do serviço em um único lock, mesmo entre clientes completamente independentes — um gargalo severo sob carga.
-- *`sync.Map`*: elimina a necessidade do `RWMutex` global para leitura/escrita concorrente do mapa, mas foi descartado porque `sync.Map` é otimizado para chaves relativamente estáveis com poucas escritas e leituras predominantes de chaves distintas — nosso padrão de acesso (leitura frequente da mesma chave, mais explícito com `RWMutex`+map comum) é mais previsível e fácil de raciocinar sobre correção neste contexto didático.
-
-**Consequências:** Requisições para clientes diferentes não competem por lock além do brevíssimo `RLock` de busca no mapa. Requisições simultâneas para o **mesmo** cliente são serializadas apenas entre si (via o `Mutex` do visitante), o que é o comportamento correto e esperado (a matemática de tokens não pode ser paralela para o mesmo estado).
+**Consequences:** Refill logic is *lazy* (computed at request time, not via a continuous per-client timer), which is more memory- and CPU-efficient for a large number of sparse clients, but requires care to avoid the bucket overflowing above the configured `burst` (mitigated with `if v.tokens > l.burst { v.tokens = l.burst }`).
 
 ---
 
-### ADR-003: Limpeza de visitantes inativos via goroutine com `time.Ticker`
+### ADR-002: Lock granularity — global RWMutex + per-visitor Mutex
 
-**Status:** Aceito
+**Status:** Accepted
 
-**Contexto:** O mapa de visitantes cresce a cada novo IP visto e nunca encolhe sozinho — em Go, mapas não expiram chaves automaticamente. Sem limpeza, o serviço vazaria memória indefinidamente em produção.
+**Context:** Multiple goroutines can access and modify rate-limiting state concurrently — both for different clients and, occasionally, for the same client (simultaneous requests from the same IP).
 
-**Decisão:** Rodar uma goroutine de background (`Limiter.StartCleanup`), disparada a partir de `main.go`, que usa um `time.Ticker` para varrer o mapa periodicamente (`RATE_LIMIT_CLEANUP_INTERVAL`) e remover visitantes cujo `lastSeen` esteja além do TTL configurado (`RATE_LIMIT_VISITOR_TTL`). A goroutine recebe um `context.Context` e encerra de forma limpa quando o contexto é cancelado (shutdown do serviço).
+**Decision:** Use two lock levels:
+1. A `sync.RWMutex` on the `Limiter`, used with `RLock` for reads (the common path: visitor already exists) and `Lock` only when creating a new visitor (with double-checked locking to avoid a race between the `RUnlock` and the write `Lock`).
+2. An individual `sync.Mutex` inside each `visitor`, protecting only that specific client's token calculation.
 
-**Alternativas descartadas:**
-- *TTL por entrada com timer individual (`time.AfterFunc` por visitante)*: mais preciso no tempo de expiração, mas cria overhead de um timer por cliente ativo — desnecessário para o caso de uso, e mais complexo de cancelar corretamente quando um visitante volta a ficar ativo antes de expirar.
-- *Sem limpeza (aceitar o leak)*: descartado por ser uma falha de design conhecida e evitável, citada explicitamente no `task.md` como requisito.
+**Alternatives discarded:**
+- *A single global Mutex* protecting reads, creation, and token math: simpler, but would serialize **all** requests to the service behind one lock, even between completely independent clients — a severe bottleneck under load.
+- *`sync.Map`*: removes the need for the global `RWMutex` for concurrent map reads/writes, but was discarded because `sync.Map` is optimized for relatively stable keys with few writes and predominantly reads of distinct keys — our access pattern (frequent reads of the same key, made more explicit with `RWMutex`+plain map) is more predictable and easier to reason about correctness for in this didactic context.
 
-**Consequências:** Existe uma janela entre a inatividade real de um cliente e sua remoção efetiva do mapa (no máximo `TTL + CLEANUP_INTERVAL`), o que é aceitável — o objetivo é limitar o crescimento do mapa, não expirar imediatamente.
-
----
-
-### ADR-004: Extração de IP com suporte a `X-Forwarded-For`, sem validação de proxy confiável
-
-**Status:** Aceito, com ressalva documentada
-
-**Contexto:** Em produção, o serviço tipicamente roda atrás de um proxy reverso ou load balancer, que reescreve `RemoteAddr` para o IP do proxy, não do cliente real. Sem suporte a `X-Forwarded-For`, o rate limiting acabaria agrupando todos os clientes sob o IP do proxy.
-
-**Decisão:** Se o header `X-Forwarded-For` estiver presente, usar o primeiro IP da lista como chave; caso contrário, usar `RemoteAddr`.
-
-**Alternativas descartadas:**
-- *Ignorar `X-Forwarded-For` e usar sempre `RemoteAddr`*: mais seguro contra spoofing, mas inutiliza o rate limiting por cliente real em qualquer topologia com proxy/load balancer na frente — cenário comum em produção.
-- *Implementar uma lista de proxies confiáveis e validar a cadeia de `X-Forwarded-For`*: mais correto e seguro, porém adiciona complexidade de configuração (lista de CIDRs confiáveis) fora do escopo deste exercício.
-
-**Consequências:** Um cliente com acesso direto ao serviço (sem passar por um proxy confiável na frente) pode forjar o header `X-Forwarded-For` e contornar o rate limiting associado ao seu IP real. Este é um trade-off consciente, documentado na seção [Limitações conhecidas](#limitações-conhecidas); antes de expor o serviço diretamente à internet sem um proxy confiável, esta lógica deve ser revisada.
+**Consequences:** Requests for different clients don't compete for locks beyond the very brief `RLock` used to look them up in the map. Simultaneous requests for the **same** client are serialized only against each other (via that visitor's `Mutex`), which is the correct and expected behavior (token math can't run in parallel against the same state).
 
 ---
 
-### ADR-005: Shutdown gracioso com `signal.NotifyContext`
+### ADR-003: Cleanup of inactive visitors via a `time.Ticker` goroutine
 
-**Status:** Aceito
+**Status:** Accepted
 
-**Contexto:** Sem tratamento de sinais, um `SIGTERM` (por exemplo, ao parar um container) mataria o processo abruptamente, cortando conexões em andamento e deixando a goroutine de limpeza órfã até o processo morrer.
+**Context:** The visitor map grows with every new IP seen and never shrinks on its own — in Go, maps don't expire keys automatically. Without cleanup, the service would leak memory indefinitely in production.
 
-**Decisão:** Usar `signal.NotifyContext` para capturar `os.Interrupt` e `syscall.SIGTERM`, propagar esse `context.Context` para a goroutine de cleanup (que encerra via `ctx.Done()`), e chamar `srv.Shutdown(shutdownCtx)` com timeout de 5 segundos ao receber o sinal.
+**Decision:** Run a background goroutine (`Limiter.StartCleanup`), started from `main.go`, that uses a `time.Ticker` to periodically sweep the map (`RATE_LIMIT_CLEANUP_INTERVAL`) and remove visitors whose `lastSeen` is beyond the configured TTL (`RATE_LIMIT_VISITOR_TTL`). The goroutine receives a `context.Context` and shuts down cleanly when the context is canceled (service shutdown).
 
-**Alternativas descartadas:**
-- *Sem tratamento de shutdown*: mais simples, mas não foi considerado aceitável para um serviço destinado a rodar em containers/orquestradores, onde `SIGTERM` é o mecanismo padrão de parada.
+**Alternatives discarded:**
+- *Per-entry TTL with an individual timer (`time.AfterFunc` per visitor)*: more precise expiration timing, but creates the overhead of one timer per active client — unnecessary for this use case, and more complex to cancel correctly when a visitor becomes active again before expiring.
+- *No cleanup (accept the leak)*: discarded as a known, avoidable design flaw, explicitly called out as a requirement in `task.md`.
 
-**Consequências:** Requisições em andamento no momento do `SIGTERM` têm até 5 segundos para completar antes do processo encerrar; a goroutine de limpeza para de forma determinística junto com o shutdown do servidor, sem vazar goroutines.
+**Consequences:** There's a window between a client's actual inactivity and its effective removal from the map (at most `TTL + CLEANUP_INTERVAL`), which is acceptable — the goal is to bound the map's growth, not to expire entries instantly.
 
 ---
 
-### ADR-006: Imagem Docker final em `scratch`
+### ADR-004: IP extraction with `X-Forwarded-For` support, without trusted-proxy validation
 
-**Status:** Aceito, com ressalva documentada
+**Status:** Accepted, with a documented caveat
 
-**Contexto:** É necessário empacotar o serviço em uma imagem Docker para deploy. O binário Go é compilado estaticamente (`CGO_ENABLED=0`), o que permite usar uma imagem final mínima.
+**Context:** In production, the service typically runs behind a reverse proxy or load balancer, which rewrites `RemoteAddr` to the proxy's IP, not the real client's. Without `X-Forwarded-For` support, rate limiting would end up grouping all clients under the proxy's IP.
 
-**Decisão:** Build multi-stage: `golang:1.22-alpine` para compilar, `scratch` como imagem final, copiando apenas o binário.
+**Decision:** If the `X-Forwarded-For` header is present, use the first IP in the list as the key; otherwise, fall back to `RemoteAddr`.
 
-**Alternativas descartadas:**
-- *Imagem final `alpine`*: inclui shell e gerenciador de pacotes, útil para debug (`docker exec` interativo) e already trazendo `ca-certificates`, mas aumenta a superfície de ataque e o tamanho da imagem sem necessidade, já que o serviço não faz chamadas HTTPS externas nem precisa de shell em runtime.
+**Alternatives discarded:**
+- *Ignore `X-Forwarded-For` and always use `RemoteAddr`*: safer against spoofing, but makes per-real-client rate limiting useless in any topology with a proxy/load balancer in front — a common production scenario.
+- *Implement a trusted-proxy list and validate the `X-Forwarded-For` chain*: more correct and secure, but adds configuration complexity (trusted CIDR list) out of scope for this exercise.
 
-**Consequências:** Imagem final mínima (poucos MBs) e com superfície de ataque reduzida (sem shell, sem gerenciador de pacotes, sem libc dinâmica). Se o serviço vier a precisar fazer chamadas HTTPS para serviços externos, será necessário adicionar `ca-certificates` (copiando de `/etc/ssl/certs/ca-certificates.crt` do estágio de build, ou trocando a imagem final para `alpine`). Debugging em produção fica mais difícil (sem shell para `exec` no container) — mitigado via logs estruturados no `stdout`.
+**Consequences:** A client with direct access to the service (not going through a trusted proxy in front) can forge the `X-Forwarded-For` header and bypass the rate limit tied to their real IP. This is a conscious trade-off, documented in the [Known limitations](#known-limitations) section; this logic should be revisited before exposing the service directly to the internet without a trusted proxy in front.
+
+---
+
+### ADR-005: Graceful shutdown with `signal.NotifyContext`
+
+**Status:** Accepted
+
+**Context:** Without signal handling, a `SIGTERM` (for example, when stopping a container) would kill the process abruptly, cutting off in-flight connections and leaving the cleanup goroutine orphaned until the process dies.
+
+**Decision:** Use `signal.NotifyContext` to capture `os.Interrupt` and `syscall.SIGTERM`, propagate that `context.Context` to the cleanup goroutine (which shuts down via `ctx.Done()`), and call `srv.Shutdown(shutdownCtx)` with a 5-second timeout upon receiving the signal.
+
+**Alternatives discarded:**
+- *No shutdown handling*: simpler, but not acceptable for a service meant to run in containers/orchestrators, where `SIGTERM` is the standard stop mechanism.
+
+**Consequences:** In-flight requests at the moment of `SIGTERM` have up to 5 seconds to complete before the process exits; the cleanup goroutine stops deterministically alongside the server shutdown, with no goroutine leaks.
+
+---
+
+### ADR-006: Final Docker image on `scratch`
+
+**Status:** Accepted, with a documented caveat
+
+**Context:** The service needs to be packaged into a Docker image for deployment. The Go binary is statically compiled (`CGO_ENABLED=0`), which allows using a minimal final image.
+
+**Decision:** Multi-stage build: `golang:1.22-alpine` to compile, `scratch` as the final image, copying only the binary.
+
+**Alternatives discarded:**
+- *`alpine` final image*: includes a shell and package manager, useful for debugging (interactive `docker exec`) and already ships `ca-certificates`, but increases the attack surface and image size unnecessarily, since the service makes no outbound HTTPS calls and needs no shell at runtime.
+
+**Consequences:** Minimal final image (a few MB) with a reduced attack surface (no shell, no package manager, no dynamic libc). If the service ever needs to make HTTPS calls to external services, `ca-certificates` will need to be added (copied from `/etc/ssl/certs/ca-certificates.crt` in the build stage, or by switching the final image to `alpine`). Debugging in production becomes harder (no shell to `exec` into the container) — mitigated via structured logs on `stdout`.
